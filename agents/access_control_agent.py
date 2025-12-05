@@ -7,7 +7,7 @@ class AccessControlAgent(BaseAgent):
     """
     Enforces role-based access control (RBAC).
     Validates every request before allowing access to patient data.
-    This is the FIRST line of defense against unauthorized access.
+    Integrates with your event queue system.
     """
     
     def __init__(self, agent_id: str = "access_control_agent"):
@@ -27,7 +27,8 @@ class AccessControlAgent(BaseAgent):
                     'create_patient',
                     'update_appointment',
                     'read_patient_basics',
-                    'schedule_doctor'
+                    'schedule_doctor',
+                    'patient_intake'  # Add this for your receptionist workflow
                 ]
             },
             'doctor': {
@@ -76,63 +77,67 @@ class AccessControlAgent(BaseAgent):
                     'retrieve_billing_info'
                 ]
             },
-            'pharmacy': {
-                'read_fields': [
-                    'patient_id', 'name', 'dob',
-                    'medications', 'prescription', 'allergies'
-                ],
-                'write_fields': ['prescription_status', 'dispensed_medications'],
-                'actions': [
-                    'retrieve_prescription',
-                    'dispense_medication',
-                    'check_interactions'
-                ]
-            },
-            'nurse': {
-                'read_fields': [
-                    'patient_id', 'name', 'dob',
-                    'diagnosis', 'medications', 'vitals',
-                    'treatment_plan', 'allergies'
-                ],
-                'write_fields': ['vitals', 'notes', 'medication_administration'],
-                'actions': [
-                    'retrieve_patient',
-                    'update_vitals',
-                    'administer_medication',
-                    'add_nursing_notes'
-                ]
+            'ehr_system': {
+                'read_fields': ['*'],  # EHR can read all
+                'write_fields': ['*'],  # EHR can write all
+                'actions': ['*']  # EHR has full access
             }
         }
         
         # Track denied access attempts for security monitoring
         self.denied_attempts = []
     
+    # -------------------------------------------------------------------------
+    # MESSAGE ROUTER
+    # -------------------------------------------------------------------------
     def process_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """
         Main entry point for access validation.
-        Implements abstract method from BaseAgent.
         
         Expected message format:
         {
             'from': 'agent_id',
-            'action': 'requested_action',
-            'fields': ['field1', 'field2'],  # Optional
-            'patient_id': 'P001'              # Optional
+            'action': 'validate_access',
+            'data': {
+                'requested_action': 'retrieve_patient',
+                'fields': ['diagnosis', 'medications'],
+                'patient_id': 'P001'
+            }
         }
+        """
         
-        Returns:
-        {
-            'status': 'approved' | 'denied',
-            'allowed_fields': [...],  # If approved
-            'reason': '...'           # If denied
-        }
+        action = message.get('action', 'unknown')
+        
+        if action == 'validate_access':
+            return self._validate_access(message)
+        
+        elif action == 'check_write_permission':
+            return self._check_write_permission(message)
+        
+        elif action == 'get_denied_attempts':
+            return self._get_denied_attempts(message.get('data', {}))
+        
+        else:
+            return {
+                'status': 'error',
+                'message': f'Unknown action: {action}'
+            }
+    
+    # -------------------------------------------------------------------------
+    # VALIDATE ACCESS
+    # -------------------------------------------------------------------------
+    def _validate_access(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate if requesting agent can perform the requested action.
         """
         
         requesting_agent = message.get('from', 'unknown')
         requesting_role = self._get_role(requesting_agent)
-        requested_action = message.get('action', 'unknown')
-        requested_fields = message.get('fields', [])
-        patient_id = message.get('patient_id', 'unknown')
+        data = message.get('data', {})
+        
+        requested_action = data.get('requested_action', 'unknown')
+        requested_fields = data.get('fields', [])
+        patient_id = data.get('patient_id', 'unknown')
         
         # Validate role exists
         if requesting_role == 'unknown':
@@ -142,6 +147,15 @@ class AccessControlAgent(BaseAgent):
                 patient_id,
                 f"Unknown agent: {requesting_agent}"
             )
+        
+        # EHR system has full access
+        if requesting_role == 'ehr_system':
+            return {
+                'status': 'approved',
+                'role': requesting_role,
+                'allowed_fields': ['*'],
+                'allowed_actions': ['*']
+            }
         
         # Check if role can perform action
         allowed_actions = self.ROLE_PERMISSIONS[requesting_role]['actions']
@@ -168,9 +182,9 @@ class AccessControlAgent(BaseAgent):
         
         # ACCESS GRANTED - Use BaseAgent's audit_log method
         self.audit_log(
-            'access_granted',
-            patient_id,
-            f"Agent: {requesting_agent}, Role: {requesting_role}, Action: {requested_action}"
+            action='access_granted',
+            patient_id=patient_id,
+            details=f"Agent: {requesting_agent}, Role: {requesting_role}, Action: {requested_action}"
         )
         
         return {
@@ -180,6 +194,9 @@ class AccessControlAgent(BaseAgent):
             'allowed_actions': allowed_actions
         }
     
+    # -------------------------------------------------------------------------
+    # DENY ACCESS
+    # -------------------------------------------------------------------------
     def _deny_access(self, agent: str, action: str, patient_id: str, reason: str) -> Dict:
         """
         Log denied access attempt and alert security monitoring.
@@ -197,9 +214,9 @@ class AccessControlAgent(BaseAgent):
         
         # Use BaseAgent's audit_log method
         self.audit_log(
-            'access_denied',
-            patient_id,
-            f"🚨 SECURITY ALERT - Agent: {agent}, Action: {action}, Reason: {reason}"
+            action='access_denied',
+            patient_id=patient_id,
+            details=f"🚨 SECURITY ALERT - Agent: {agent}, Action: {action}, Reason: {reason}"
         )
         
         # Alert IDS Agent using BaseAgent's send_message
@@ -212,44 +229,40 @@ class AccessControlAgent(BaseAgent):
             'severity': 'SECURITY_ALERT'
         }
     
-    def _get_role(self, agent_id: str) -> str:
-        """
-        Map agent ID to role.
-        """
-        role_mapping = {
-            'receptionist_agent_1': 'receptionist',
-            'receptionist_agent': 'receptionist',
-            'doctor_agent_1': 'doctor',
-            'doctor_agent': 'doctor',
-            'lab_agent_1': 'lab_tech',
-            'lab_agent': 'lab_tech',
-            'billing_agent_1': 'billing',
-            'billing_agent': 'billing',
-            'pharmacy_agent_1': 'pharmacy',
-            'pharmacy_agent': 'pharmacy',
-            'nurse_agent_1': 'nurse',
-            'nurse_agent': 'nurse'
-        }
-        
-        return role_mapping.get(agent_id, 'unknown')
-    
-    def check_write_permission(self, agent_id: str, field: str) -> bool:
+    # -------------------------------------------------------------------------
+    # CHECK WRITE PERMISSION
+    # -------------------------------------------------------------------------
+    def _check_write_permission(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """
         Check if agent can write to a specific field.
         """
+        agent_id = message.get('from', 'unknown')
+        field = message.get('data', {}).get('field', '')
+        
         role = self._get_role(agent_id)
         
         if role == 'unknown':
-            return False
+            return {'status': 'denied', 'can_write': False}
+        
+        if role == 'ehr_system':
+            return {'status': 'approved', 'can_write': True}
         
         write_fields = self.ROLE_PERMISSIONS[role]['write_fields']
-        return field in write_fields
+        can_write = field in write_fields
+        
+        return {
+            'status': 'approved' if can_write else 'denied',
+            'can_write': can_write
+        }
     
-    def get_denied_attempts(self, time_window_minutes: int = 60) -> List[Dict]:
+    # -------------------------------------------------------------------------
+    # GET DENIED ATTEMPTS
+    # -------------------------------------------------------------------------
+    def _get_denied_attempts(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Retrieve denied access attempts within time window.
-        Used by IDS for anomaly detection.
         """
+        time_window_minutes = data.get('time_window_minutes', 60)
         cutoff = datetime.now().timestamp() - (time_window_minutes * 60)
         
         recent_denials = []
@@ -258,7 +271,33 @@ class AccessControlAgent(BaseAgent):
             if attempt_time > cutoff:
                 recent_denials.append(attempt)
         
-        return recent_denials
+        return {
+            'status': 'success',
+            'denial_count': len(recent_denials),
+            'denials': recent_denials
+        }
+    
+    # -------------------------------------------------------------------------
+    # HELPER METHODS
+    # -------------------------------------------------------------------------
+    def _get_role(self, agent_id: str) -> str:
+        """
+        Map agent ID to role.
+        """
+        role_mapping = {
+            'receptionist_agent': 'receptionist',
+            'receptionist_agent_1': 'receptionist',
+            'doctor_agent': 'doctor',
+            'doctor_agent_1': 'doctor',
+            'lab_agent': 'lab_tech',
+            'lab_agent_1': 'lab_tech',
+            'billing_agent': 'billing',
+            'billing_agent_1': 'billing',
+            'ehr_agent': 'ehr_system',
+            'ehr_agent_1': 'ehr_system'
+        }
+        
+        return role_mapping.get(agent_id, 'unknown')
     
     def get_role_permissions_summary(self, role: str) -> Dict:
         """
@@ -277,158 +316,69 @@ class AccessControlAgent(BaseAgent):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("ACCESS CONTROL AGENT - DEMO (Standalone Mode)")
+    print("ACCESS CONTROL AGENT - DEMO")
     print("=" * 70)
     
     # Initialize agent (no event queue for standalone demo)
     access_control = AccessControlAgent()
     
-    # ==========================================
-    # TEST 1: AUTHORIZED ACCESS (Doctor)
-    # ==========================================
+    # Test 1: Authorized access (Receptionist)
     print("\n" + "=" * 70)
-    print("TEST 1: AUTHORIZED ACCESS - Doctor retrieving patient record")
+    print("TEST 1: RECEPTIONIST - Patient intake (AUTHORIZED)")
     print("=" * 70)
     
-    doctor_request = {
-        'from': 'doctor_agent_1',
-        'action': 'retrieve_patient',
-        'fields': ['patient_id', 'diagnosis', 'medications', 'lab_results'],
-        'patient_id': 'P001'
+    receptionist_msg = {
+        'from': 'receptionist_agent',
+        'action': 'validate_access',
+        'data': {
+            'requested_action': 'patient_intake',
+            'fields': ['name', 'dob', 'contact'],
+            'patient_id': 'P001'
+        }
     }
     
-    doctor_response = access_control.process_message(doctor_request)
+    response = access_control.process_message(receptionist_msg)
+    print(f"✅ Status: {response['status']}")
+    print(f"📝 Role: {response.get('role', 'N/A')}")
     
-    print(f"\n✅ Status: {doctor_response['status']}")
-    print(f"👨‍⚕️ Role: {doctor_response.get('role', 'N/A')}")
-    print(f"📊 Allowed fields: {len(doctor_response.get('allowed_fields', []))} fields")
-    print(f"🔓 Allowed actions: {doctor_response.get('allowed_actions', [])[:3]}...")
-    print(f"\n💡 Result: Doctor APPROVED to retrieve patient record")
-    
-    # ==========================================
-    # TEST 2: UNAUTHORIZED ACTION (Receptionist)
-    # ==========================================
+    # Test 2: Unauthorized access (Receptionist trying to access diagnosis)
     print("\n" + "=" * 70)
-    print("TEST 2: UNAUTHORIZED ACTION - Receptionist trying to access diagnosis")
+    print("TEST 2: RECEPTIONIST - Access diagnosis (DENIED)")
     print("=" * 70)
     
-    receptionist_request = {
-        'from': 'receptionist_agent_1',
-        'action': 'write_diagnosis',  # NOT allowed for receptionist
-        'fields': ['diagnosis'],
-        'patient_id': 'P001'
+    unauthorized_msg = {
+        'from': 'receptionist_agent',
+        'action': 'validate_access',
+        'data': {
+            'requested_action': 'write_diagnosis',
+            'fields': ['diagnosis'],
+            'patient_id': 'P001'
+        }
     }
     
-    receptionist_response = access_control.process_message(receptionist_request)
+    response = access_control.process_message(unauthorized_msg)
+    print(f"🚫 Status: {response['status']}")
+    print(f"📝 Reason: {response.get('reason', 'N/A')}")
     
-    print(f"\n🚫 Status: {receptionist_response['status']}")
-    print(f"⚠️  Severity: {receptionist_response.get('severity', 'N/A')}")
-    print(f"📝 Reason: {receptionist_response['reason']}")
-    print(f"\n💡 Result: Receptionist DENIED - action not permitted for role")
-    
-    # ==========================================
-    # TEST 3: UNAUTHORIZED FIELD ACCESS (Billing)
-    # ==========================================
+    # Test 3: Doctor accessing patient (AUTHORIZED)
     print("\n" + "=" * 70)
-    print("TEST 3: UNAUTHORIZED FIELD - Billing trying to access psychiatric history")
+    print("TEST 3: DOCTOR - Retrieve patient (AUTHORIZED)")
     print("=" * 70)
     
-    billing_request = {
-        'from': 'billing_agent_1',
-        'action': 'retrieve_billing_info',  # Valid action
-        'fields': ['ssn', 'insurance_details', 'psychiatric_history'],  # psychiatric_history NOT allowed
-        'patient_id': 'P001'
+    doctor_msg = {
+        'from': 'doctor_agent',
+        'action': 'validate_access',
+        'data': {
+            'requested_action': 'retrieve_patient',
+            'fields': ['diagnosis', 'medications', 'lab_results'],
+            'patient_id': 'P001'
+        }
     }
     
-    billing_response = access_control.process_message(billing_request)
-    
-    print(f"\n🚫 Status: {billing_response['status']}")
-    print(f"⚠️  Severity: {billing_response.get('severity', 'N/A')}")
-    print(f"📝 Reason: {billing_response['reason']}")
-    print(f"\n💡 Result: Billing DENIED - cannot access clinical fields")
-    
-    # ==========================================
-    # TEST 4: UNKNOWN AGENT
-    # ==========================================
-    print("\n" + "=" * 70)
-    print("TEST 4: UNKNOWN AGENT - Unauthorized system trying to access data")
-    print("=" * 70)
-    
-    unknown_request = {
-        'from': 'malicious_agent_xyz',  # Not in role mapping
-        'action': 'retrieve_patient',
-        'fields': ['patient_id', 'diagnosis'],
-        'patient_id': 'P001'
-    }
-    
-    unknown_response = access_control.process_message(unknown_request)
-    
-    print(f"\n🚫 Status: {unknown_response['status']}")
-    print(f"⚠️  Severity: {unknown_response.get('severity', 'N/A')}")
-    print(f"📝 Reason: {unknown_response['reason']}")
-    print(f"\n💡 Result: Unknown agent DENIED - not recognized in system")
-    
-    # ==========================================
-    # TEST 5: VALID ACCESS (Lab Tech)
-    # ==========================================
-    print("\n" + "=" * 70)
-    print("TEST 5: VALID ACCESS - Lab Tech submitting lab results")
-    print("=" * 70)
-    
-    lab_request = {
-        'from': 'lab_agent_1',
-        'action': 'submit_lab_results',
-        'fields': ['lab_results'],
-        'patient_id': 'P001'
-    }
-    
-    lab_response = access_control.process_message(lab_request)
-    
-    print(f"\n✅ Status: {lab_response['status']}")
-    print(f"🔬 Role: {lab_response.get('role', 'N/A')}")
-    print(f"🔓 Allowed actions: {lab_response.get('allowed_actions', [])}")
-    print(f"\n💡 Result: Lab Tech APPROVED to submit results")
-    
-    # ==========================================
-    # SECURITY SUMMARY
-    # ==========================================
-    print("\n" + "=" * 70)
-    print("SECURITY SUMMARY")
-    print("=" * 70)
-    
-    denied_count = len(access_control.denied_attempts)
-    
-    print(f"\n📊 Total Access Attempts: 5")
-    print(f"✅ Approved: 2 (Doctor, Lab Tech)")
-    print(f"🚫 Denied: {denied_count} (Receptionist, Billing, Unknown Agent)")
-    print(f"🎯 Denial Rate: {(denied_count/5)*100:.0f}%")
-    
-    print(f"\n🚨 DENIED ATTEMPTS LOG:")
-    for i, attempt in enumerate(access_control.denied_attempts, 1):
-        print(f"\n   Attempt {i}:")
-        print(f"   Agent: {attempt['agent']}")
-        print(f"   Action: {attempt['action']}")
-        print(f"   Reason: {attempt['reason']}")
+    response = access_control.process_message(doctor_msg)
+    print(f"✅ Status: {response['status']}")
+    print(f"👨‍⚕️ Role: {response.get('role', 'N/A')}")
     
     print("\n" + "=" * 70)
-    print("DEMO TALKING POINTS")
-    print("=" * 70)
-    print("""
-✅ PROBLEM SOLVED: Unauthorized access to patient records
-
-✅ YOUR SOLUTION: Role-based access control (RBAC) validates EVERY request
-
-✅ DEMO EVIDENCE:
-   - Doctor accessing diagnosis: ✅ APPROVED
-   - Receptionist accessing diagnosis: 🚫 DENIED
-   - Billing accessing psychiatric history: 🚫 DENIED
-   - Unknown agent accessing data: 🚫 DENIED
-   - 100% of unauthorized access attempts blocked
-
-✅ REAL-WORLD IMPACT:
-   "The Apollo Hospitals breach exposed millions of records because staff
-   could access data beyond their role. Our Access Control Agent enforces
-   strict permissions. We blocked 3 unauthorized attempts in this demo—
-   preventing the next hospital breach before it happens."
-    """)
+    print("✅ Access Control Demo Complete")
     print("=" * 70)
