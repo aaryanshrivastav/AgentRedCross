@@ -1,0 +1,9 @@
+psycopg2-binary
+uuid
+python-dotenv
+
+fastapi
+uvicorn
+pydantic
+
+pytest
